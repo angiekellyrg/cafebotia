@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CaféBot IA | Tu cafetería virtual</title>
+  <style>
+    :root { --coffee:#6c4430; --cream:#fff9f0; --accent:#c48757; --ink:#34251e; --muted:#8d7c71; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; color:var(--ink); background:radial-gradient(circle at 12% 10%,#f6dfc8,transparent 38%),linear-gradient(135deg,#f9f2e9,#e8d6c3); min-height:100vh; display:grid; place-items:center; padding:20px; }
+    .app { width:min(100%,860px); height:min(92vh,800px); min-height:530px; display:flex; flex-direction:column; overflow:hidden; background:var(--cream); border:1px solid #e7d8c7; border-radius:24px; box-shadow:0 25px 75px #4b2d1e26; }
+    header { background:var(--coffee); color:#fff; padding:22px 26px; display:flex; align-items:center; gap:15px; }
+    .avatar { background:#ffffff23; width:52px; height:52px; display:grid; place-items:center; border-radius:17px; font-size:29px; }
+    h1 { font-size:22px; margin:0 0 3px; } .status { font-size:13px; color:#f5d9c3; }
+    .status::before { content:'●'; margin-right:7px; } .status.online::before { color:#84e3a0; } .status.offline::before { color:#ffc48c; }
+    .messages { flex:1; overflow-y:auto; padding:28px; display:flex; flex-direction:column; gap:16px; }
+    .message { max-width:78%; padding:13px 17px; line-height:1.55; border-radius:17px; white-space:pre-wrap; overflow-wrap:anywhere; font-size:15px; }
+    .bot { align-self:flex-start; background:#f0e7dc; border-bottom-left-radius:5px; }
+    .user { align-self:flex-end; background:var(--coffee); color:white; border-bottom-right-radius:5px; }
+    .time { display:block; margin-top:7px; font-size:10px; opacity:.65; text-align:right; }
+    .notice { text-align:center; font-size:12px; color:var(--muted); }
+    .pay-link { display:inline-flex; align-items:center; justify-content:center; margin-top:12px; padding:12px 18px; border-radius:12px; background:#6350b5; color:white; font-weight:700; text-decoration:none; white-space:normal; }
+    .pay-link:hover { background:#4e3c99; }
+    form { display:flex; gap:10px; padding:18px 22px; border-top:1px solid #e9ded2; background:#fffaf4; }
+    input { flex:1; min-width:0; padding:15px 17px; border-radius:14px; border:1px solid #dccbb9; font:inherit; outline:none; background:white; }
+    input:focus { border-color:var(--accent); box-shadow:0 0 0 3px #c4875725; }
+    button { background:var(--coffee); color:white; border:0; border-radius:14px; padding:0 23px; font:inherit; font-weight:650; cursor:pointer; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    #micButton { padding:0 17px; min-width:52px; }
+    #micButton.recording { background:#b73535; }
+    footer { text-align:center; padding:0 15px 13px; background:#fffaf4; color:var(--muted); font-size:11px; }
+    @media(max-width:600px) { body { padding:0; } .app { height:100dvh; min-height:0; border-radius:0; } .messages { padding:18px 13px; } .message { max-width:88%; } header { padding:16px; } form { padding:12px; } }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div class="avatar" aria-hidden="true">☕</div>
+      <div><h1>CaféBot IA</h1><div id="status" class="status offline">Conectando...</div></div>
+    </header>
+    <section id="messages" class="messages" aria-live="polite" aria-label="Conversación"></section>
+    <form id="form">
+      <input id="messageInput" type="text" maxlength="2000" autocomplete="off" placeholder="Escribe tu mensaje..." aria-label="Mensaje" required />
+      <button id="micButton" type="button" disabled aria-label="Grabar audio" title="Grabar audio">🎤</button>
+      <button id="sendButton" type="submit" disabled>Enviar ➤</button>
+    </form>
+    <footer>Pagos seguros mediante Stripe Checkout · Conversación guardada en este navegador y DynamoDB.</footer>
+  </main>
+  <script>
+    'use strict';
+    const WS_URL = 'wss://ycazeam506.execute-api.us-east-1.amazonaws.com/production/';
+    const STORAGE_KEY = 'cafebot_mensajes_v2';
+    const TOKEN_KEY = 'cafebot_chat_token_v1';
+    let chatToken = localStorage.getItem(TOKEN_KEY);
+    if (!chatToken || !/^[a-f0-9]{64}$/.test(chatToken)) {
+      const bytes = new Uint8Array(32);
+      crypto.getRandomValues(bytes);
+      chatToken = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+      localStorage.setItem(TOKEN_KEY, chatToken);
+    }
+    const params = new URLSearchParams(location.search);
+    const returnSession = params.get('session_id');
+    const returnedFromStripe = params.get('pago') === 'success' && returnSession;
+    let paymentCheckSent = false;
+    const messagesEl = document.getElementById('messages');
+    const statusEl = document.getElementById('status');
+    const inputEl = document.getElementById('messageInput');
+    const sendButton = document.getElementById('sendButton');
+    const micButton = document.getElementById('micButton');
+    let ws;
+    let reconnectDelay = 1000;
+    let messages = [];
+    let recorder = null;
+    let audioStream = null;
+    let audioChunks = [];
+    let audioUpload = null;
+    let voiceDownload = null;
+    let audioBusy = false;
+    let activeAudio = null;
+
+    function stripeCheckoutUrl(value) {
+      if (typeof value !== 'string') return null;
+      try {
+        const url = new URL(value);
+        return url.protocol === 'https:' && url.hostname === 'checkout.stripe.com' ? url.href : null;
+      } catch (_) { return null; }
+    }
+
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+      if (Array.isArray(saved)) {
+        messages = saved.filter(x => x && ['bot','user'].includes(x.role) && typeof x.text === 'string')
+          .map(x => ({ role:x.role, text:x.text, time:x.time, url_pago:stripeCheckoutUrl(x.url_pago) }))
+          .slice(-150);
+      }
+    } catch (_) { messages = []; }
+
+    function renderMessage(role, text, time = new Date().toLocaleTimeString('es-PE',{hour:'2-digit',minute:'2-digit'}), url_pago = null) {
+      const el = document.createElement('div');
+      el.className = 'message ' + role;
+      const content = document.createElement('div');
+      content.textContent = text;
+      el.appendChild(content);
+
+      const safeUrl = role === 'bot' ? stripeCheckoutUrl(url_pago) : null;
+      if (safeUrl) {
+        const link = document.createElement('a');
+        link.className = 'pay-link';
+        link.href = safeUrl;
+        link.target = '_self';
+        link.rel = 'noopener noreferrer';
+        link.textContent = '💳 Pagar con Stripe';
+        el.appendChild(link);
+      }
+      const t = document.createElement('span');
+      t.className = 'time';
+      t.textContent = time;
+      el.appendChild(t);
+      messagesEl.appendChild(el);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function addMessage(role, text, url_pago = null) {
+      const time = new Date().toLocaleTimeString('es-PE',{hour:'2-digit',minute:'2-digit'});
+      const safeUrl = stripeCheckoutUrl(url_pago);
+      messages.push({role,text,time,...(safeUrl ? {url_pago:safeUrl} : {})});
+      messages = messages.slice(-150);
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(messages)); } catch (_) {}
+      renderMessage(role,text,time,safeUrl);
+    }
+
+    if (messages.length) messages.forEach(x => renderMessage(x.role,x.text,x.time,x.url_pago));
+    else addMessage('bot','¡Hola! ☕ Soy CaféBot IA. ¿Qué te gustaría tomar hoy?');
+
+    function updateStatus(connected, label) {
+      statusEl.textContent = label;
+      statusEl.className = 'status ' + (connected ? 'online' : 'offline');
+      sendButton.disabled = !connected;
+      micButton.disabled = !connected || audioBusy || !window.MediaRecorder || !navigator.mediaDevices?.getUserMedia;
+    }
+
+    function connect() {
+      updateStatus(false,'Conectando...');
+      const socket = new WebSocket(WS_URL);
+      ws = socket;
+      socket.onopen = () => {
+        reconnectDelay = 1000;
+        updateStatus(true,'Conectado · Listo para ayudarte');
+        socket.send(JSON.stringify({action:'enviarmensaje',operacion:'recuperar',chat_token:chatToken}));
+
+      };
+      socket.onmessage = event => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.tipo === 'audio_ack') {
+            if (audioUpload && data.audio_id === audioUpload.id && data.indice === audioUpload.next) {
+              audioUpload.next++;
+              sendNextAudioPart();
+            }
+          } else if (data.tipo === 'transcripcion') {
+            addMessage('user', '🎤 ' + data.mensaje);
+            statusEl.textContent = 'Generando respuesta...';
+          } else if (data.tipo === 'voz_inicio') {
+            voiceDownload = {id:data.audio_id, total:data.total, parts:[]};
+          } else if (data.tipo === 'voz_parte') {
+            if (voiceDownload && voiceDownload.id === data.audio_id && data.indice === voiceDownload.parts.length) {
+              voiceDownload.parts.push(data.datos);
+            }
+          } else if (data.tipo === 'voz_fin') {
+            if (voiceDownload && voiceDownload.id === data.audio_id && voiceDownload.parts.length === voiceDownload.total) {
+              const binaryParts = voiceDownload.parts.map(x => Uint8Array.from(atob(x), c => c.charCodeAt(0)));
+              const blob = new Blob(binaryParts, {type:'audio/mpeg'});
+              const url = URL.createObjectURL(blob);
+              playVoice(url);
+            } else { finishAudio(); }
+            voiceDownload = null;
+          } else if (data.tipo === 'voz_error') {
+            addMessage('bot', data.mensaje);
+            finishAudio();
+          } else if (data.tipo === 'historial') {
+
+            if (Array.isArray(data.historial) && data.historial.length) {
+              messages = data.historial.filter(x => x && ['user','assistant'].includes(x.role) && typeof x.content === 'string')
+                .map(x => ({role:x.role === 'assistant' ? 'bot' : 'user',text:x.content,time:''})).slice(-150);
+              // Conservar enlaces de pago del navegador si aún no se han confirmado.
+// Recuperar los enlaces de pago sin duplicar mensajes.
+const pagos = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]')
+  .filter(x => stripeCheckoutUrl(x.url_pago));
+
+for (const pago of pagos) {
+  const existente = messages.find(
+    x => x.role === 'bot' && x.text === pago.text
+  );
+
+  if (existente) {
+    existente.url_pago = pago.url_pago;
+  } else {
+    messages.push(pago);
+  }
+}
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+              messagesEl.replaceChildren();
+              messages.forEach(x => renderMessage(x.role,x.text,x.time,x.url_pago));
+            }
+            if (returnedFromStripe && !paymentCheckSent) {
+              socket.send(JSON.stringify({action:'enviarmensaje',operacion:'verificar_pago',chat_token:chatToken,session_id:returnSession}));
+              paymentCheckSent = true;
+            }
+          } else if (data.tipo === 'pago_confirmado') {
+            if (!messages.some(x => x.text === data.mensaje)) addMessage('bot', data.mensaje);
+            // No conservar session_id en la barra de direcciones tras confirmar.
+            history.replaceState(null, '', location.pathname);
+          } else if (data.tipo === 'pago_pendiente') {
+            addMessage('bot', data.mensaje);
+            paymentCheckSent = false;
+          } else if (data.tipo === 'pago') {
+            addMessage('bot', typeof data.mensaje === 'string' ? data.mensaje : '¡Tu enlace de pago está listo!', data.url_pago);
+            if (!audioBusy) finishAudio();
+          } else if (data.tipo === 'respuesta' && typeof data.mensaje === 'string') {
+            addMessage('bot',data.mensaje);
+            if (!audioBusy) finishAudio();
+          } else if (data.tipo === 'error') {
+            addMessage('bot',data.mensaje || 'Ocurrió un error.');
+            finishAudio();
+          }
+        } catch (error) { console.warn('Mensaje WebSocket no reconocido:', error); }
+      };
+      socket.onerror = () => updateStatus(false,'Problema de conexión');
+      socket.onclose = () => {
+        if (ws !== socket) return;
+        finishAudio();
+       updateStatus(false,'Desconectado · Reconectando...');
+        setTimeout(connect,reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2,15000);
+      };
+    }
+
+    function finishAudio() {
+      audioBusy = false;
+      audioUpload = null;
+      micButton.classList.remove('recording');
+      micButton.textContent = '🎤';
+      micButton.disabled = !ws || ws.readyState !== WebSocket.OPEN;
+      if (ws && ws.readyState === WebSocket.OPEN) statusEl.textContent = 'Conectado · Listo para ayudarte';
+    }
+
+    function sendNextAudioPart() {
+      if (!audioUpload || !ws || ws.readyState !== WebSocket.OPEN) { finishAudio(); return; }
+      const a = audioUpload;
+      if (a.next === a.parts.length) {
+        ws.send(JSON.stringify({action:'enviarmensaje', operacion:'audio', chat_token:chatToken,
+          audio_id:a.id, total:a.parts.length}));
+        audioUpload = null;
+        statusEl.textContent = 'Transcribiendo audio...';
+        return;
+      }
+      ws.send(JSON.stringify({action:'enviarmensaje', operacion:'audio_parte', chat_token:chatToken,
+        audio_id:a.id, indice:a.next, total:a.parts.length, datos:a.parts[a.next]}));
+      statusEl.textContent = `Enviando audio ${a.next + 1}/${a.parts.length}...`;
+    }
+
+    async function uploadAudio(blob) {
+      if (blob.size > 360 * 1024) {
+        addMessage('bot','Audio demasiado largo. Graba un mensaje de unos pocos segundos.');
+        finishAudio(); return;
+      }
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const parts = [];
+      for (let i = 0; i < bytes.length; i += 12000) {
+        const chunk = bytes.subarray(i, i + 12000);
+        let binary = '';
+        for (const b of chunk) binary += String.fromCharCode(b);
+        parts.push(btoa(binary));
+      }
+      if (!parts.length || parts.length > 32) { finishAudio(); return; }
+      const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2,'0')).join('');
+      audioUpload = {id, parts, next:0};
+      sendNextAudioPart();
+    }
+
+    async function playVoice(url) {
+      if (!url || typeof url !== 'string') { finishAudio(); return; }
+      try {
+        if (activeAudio) activeAudio.pause();
+        activeAudio = new Audio(url);
+        activeAudio.onended = () => { URL.revokeObjectURL(url); finishAudio(); };
+        activeAudio.onerror = () => { URL.revokeObjectURL(url); finishAudio(); };
+        await activeAudio.play();
+      } catch(err) {
+        console.warn('Reproducción bloqueada:', err);
+        addMessage('bot','El navegador bloqueó la reproducción automática. La respuesta escrita está arriba.');
+        finishAudio();
+      }
+    }
+
+    micButton.addEventListener('click', async () => {
+      if (recorder && recorder.state === 'recording') {
+        recorder.stop();
+        micButton.textContent = '⏳';
+        micButton.classList.remove('recording');
+        return;
+      }
+      if (audioBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!MediaRecorder.isTypeSupported('audio/webm')) {
+        addMessage('bot','Este navegador no permite grabar WebM. Prueba con Chrome o Edge.');
+        return;
+      }
+      try {
+        audioStream = await navigator.mediaDevices.getUserMedia({audio:true});
+        recorder = new MediaRecorder(audioStream, {mimeType:'audio/webm'});
+        audioChunks = [];
+        audioBusy = true;
+        recorder.ondataavailable = e => { if (e.data.size) audioChunks.push(e.data); };
+        recorder.onstop = () => {
+          audioStream.getTracks().forEach(t => t.stop());
+          const recordedBlob = new Blob(audioChunks,{type:'audio/webm'});
+          if (!recordedBlob.size) { finishAudio(); return; }
+          uploadAudio(recordedBlob).catch(err => {
+            console.error('Error enviando audio:', err);
+            addMessage('bot','No se pudo enviar el audio.'); finishAudio();
+          });
+        };
+        recorder.start();
+        micButton.textContent = '⏹';
+        micButton.classList.add('recording');
+        statusEl.textContent = 'Grabando... pulsa de nuevo para detener';
+      } catch(err) {
+        addMessage('bot','No se pudo acceder al micrófono: '+err.message);
+        if (audioStream) audioStream.getTracks().forEach(t => t.stop());
+        finishAudio();
+      }
+    });
+
+    document.getElementById('form').addEventListener('submit', event => {
+      event.preventDefault();
+      const mensaje = inputEl.value.trim();
+      if (!mensaje || !ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({action:'enviarmensaje',operacion:'mensaje',chat_token:chatToken,mensaje}));
+      addMessage('user',mensaje);
+      inputEl.value = '';
+      inputEl.focus();
+    });
+    connect();
+  </script>
+</body>
+</html>
