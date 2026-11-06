@@ -1,0 +1,824 @@
+
+import json
+import os
+import re
+import hashlib
+import base64
+import io
+import uuid
+import time
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+
+import boto3
+import stripe
+from openai import OpenAI
+
+MAX_AUDIO_BYTES = 360 * 1024
+MAX_AUDIO_PARTS = 32
+
+TABLA = boto3.resource("dynamodb").Table("CafeBotConversaciones")
+
+IA = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"],
+    timeout=20.0,
+    max_retries=0
+)
+
+stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+
+URL_RETORNO = (
+    os.environ.get(
+        "CHECKOUT_RETURN_URL",
+        "url_website"
+    ).rstrip("/") + "/"
+)
+
+CATALOGO = {
+    "capuchino": {
+        "nombre": "Capuchino",
+        "precio": 1200
+    },
+    "latte": {
+        "nombre": "Latte",
+        "precio": 1300
+    },
+    "mocaccino": {
+        "nombre": "Mocaccino",
+        "precio": 1400
+    },
+    "chocolate": {
+        "nombre": "Chocolate caliente",
+        "precio": 1500
+    },
+    "croissant": {
+        "nombre": "Croissant",
+        "precio": 800
+    }
+}
+
+def enviar(api, conexion, datos):
+    api.post_to_connection(
+        ConnectionId=conexion,
+        Data=json.dumps(
+            datos,
+            ensure_ascii=False
+        ).encode("utf-8")
+    )
+
+def claves(token):
+
+    if (
+        not isinstance(token, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", token)
+    ):
+        raise ValueError("Sesion anonima invalida")
+
+    digest = hashlib.sha256(
+        bytes.fromhex(token)
+    ).hexdigest()
+
+    return (
+        "CLIENTE#" + digest,
+        "CONV#chat_" + digest
+    )
+
+
+def leer(pk, sk):
+
+    resultado = TABLA.get_item(
+        Key={
+            "PK": pk,
+            "SK": sk
+        },
+        ConsistentRead=True
+    )
+
+    return resultado.get("Item", {})
+
+
+def guardar(pk, sk, item):
+
+    item["PK"] = pk
+    item["SK"] = sk
+
+    item["cliente_id"] = pk.split("#", 1)[1]
+    item["conversacion_id"] = sk.split("#", 1)[1]
+
+    item["fecha_actualizacion"] = (
+        datetime.now(timezone.utc).isoformat()
+    )
+
+    TABLA.put_item(Item=item)
+
+def interpretar(mensaje):
+
+    resultado = IA.responses.create(
+        model="gpt-4.1-mini",
+        instructions=(
+            "Extrae solo productos solicitados en este "
+            "mensaje de una cafeteria. "
+            "Devuelve EXCLUSIVAMENTE JSON valido con forma "
+            '{"productos":[{"id":"latte","cantidad":2}]}. '
+            "IDs permitidos: "
+            + ", ".join(CATALOGO)
+            + ". Si no hay pedido concreto, usa "
+            '{"productos":[]}. '
+            "No inventes productos. "
+            "Preguntar por el menu no es comprar."
+        ),
+        input=mensaje,
+        max_output_tokens=180
+    )
+
+    try:
+        obj = json.loads(resultado.output_text)
+    except (ValueError, TypeError):
+        return []
+
+    agrupado = {}
+
+    for p in obj.get("productos", []):
+
+        if not isinstance(p, dict):
+            continue
+
+        idp = p.get("id")
+        cant = p.get("cantidad")
+
+        if (
+            idp in CATALOGO
+            and type(cant) is int
+            and 1 <= cant <= 20
+        ):
+            agrupado[idp] = min(
+                20,
+                agrupado.get(idp, 0) + cant
+            )
+
+    return [
+        {
+            "id": k,
+            "cantidad": v
+        }
+        for k, v in agrupado.items()
+    ]
+
+
+def resumen(pedido):
+
+    lineas = []
+    total = 0
+
+    for p in pedido:
+
+        producto = CATALOGO[p["id"]]
+
+        subtotal = (
+            producto["precio"] * p["cantidad"]
+        )
+
+        total += subtotal
+
+        lineas.append(
+            f"{p['cantidad']} x "
+            f"{producto['nombre']}: "
+            f"S/ {subtotal / 100:.2f}"
+        )
+
+    return (
+        "\n".join(lineas)
+        + f"\nTotal: S/ {total / 100:.2f}",
+        total
+    )
+
+
+def crear_checkout(pedido, pk, sk):
+
+    if not URL_RETORNO.startswith("https://"):
+        raise ValueError(
+            "CHECKOUT_RETURN_URL debe ser HTTPS"
+        )
+
+    line_items = []
+
+    for p in pedido:
+
+        producto = CATALOGO[p["id"]]
+
+        line_items.append({
+            "price_data": {
+                "currency": "pen",
+                "unit_amount": producto["precio"],
+                "product_data": {
+                    "name": producto["nombre"]
+                }
+            },
+            "quantity": p["cantidad"]
+        })
+
+    sesion = stripe.checkout.Session.create(
+        mode="payment",
+        line_items=line_items,
+
+        success_url=(
+            URL_RETORNO
+            + "?pago=success"
+            + "&session_id={CHECKOUT_SESSION_ID}"
+        ),
+
+        cancel_url=(
+            URL_RETORNO
+            + "?pago=cancel"
+        ),
+
+        metadata={
+            "chat_key": pk[8:]
+        }
+    )
+
+    return sesion
+
+
+def verificar_pago(
+    api,
+    conexion,
+    session_id,
+    pk,
+    sk,
+    item,
+    historial
+):
+
+    if (
+        not isinstance(session_id, str)
+        or not re.fullmatch(
+            r"cs_(test|live)_[A-Za-z0-9]+",
+            session_id
+        )
+    ):
+        raise ValueError(
+            "Identificador de Stripe invalido"
+        )
+
+
+
+    if session_id != item.get("stripe_session_id"):
+
+        enviar(api, conexion, {
+            "tipo": "error",
+            "mensaje": (
+                "Este pago no corresponde a este chat."
+            )
+        })
+
+        return
+
+    sesion = stripe.checkout.Session.retrieve(
+        session_id
+    )
+
+    sesion = sesion.to_dict()
+
+    pedido = item.get("pedido_pendiente", [])
+
+    if not pedido:
+        enviar(api, conexion, {
+            "tipo": "error",
+            "mensaje": (
+                "No se encontro un pedido asociado "
+                "a este pago."
+            )
+        })
+        return
+
+    _, total = resumen(pedido)
+
+
+    pago_valido = (
+        sesion.get("id") == session_id
+        and sesion.get("payment_status") == "paid"
+        and sesion.get("status") == "complete"
+        and sesion.get("currency") == "pen"
+        and sesion.get("amount_total") == total
+        and (
+            sesion.get("metadata") or {}
+        ).get("chat_key") == pk[8:]
+    )
+
+    if pago_valido:
+
+        texto = (
+            "✅ ¡Tu pedido fue confirmado! "
+            "Muchas gracias por tu compra. ☕"
+        )
+        if (
+            item.get("stripe_confirmada_id")
+            != session_id
+        ):
+
+            historial.append({
+                "role": "assistant",
+                "content": texto
+            })
+
+            item["historial"] = historial
+
+            item["estado_pedido"] = "pagado"
+
+            item["stripe_confirmada_id"] = (
+                session_id
+            )
+
+            guardar(pk, sk, item)
+
+        enviar(api, conexion, {
+            "tipo": "pago_confirmado",
+            "mensaje": texto,
+            "historial": historial[-150:]
+        })
+
+    else:
+
+        enviar(api, conexion, {
+            "tipo": "pago_pendiente",
+            "mensaje": (
+                "El pago aun no figura como "
+                "confirmado en Stripe."
+            )
+        })
+
+
+def normalizar(mensaje):
+
+    texto = mensaje.lower().strip()
+
+    texto = re.sub(
+        r"[.!¡¿?,;:]+",
+        " ",
+        texto
+    )
+
+    return " ".join(texto.split())
+
+
+def es_confirmacion(mensaje):
+
+    texto = normalizar(mensaje)
+
+    confirmaciones = {
+        "si",
+        "sí",
+        "confirmo",
+        "confirmar",
+        "si confirmo",
+        "sí confirmo",
+        "pagar",
+        "quiero pagar",
+        "si quiero pagar",
+        "sí quiero pagar",
+        "proceder al pago",
+        "confirmo mi pedido",
+        "confirmo el pedido",
+        "si pagar",
+        "sí pagar"
+    }
+
+    return texto in confirmaciones
+
+
+def es_cancelacion(mensaje):
+
+    texto = normalizar(mensaje)
+
+    cancelaciones = {
+        "no",
+        "cancelar",
+        "cancela",
+        "no gracias",
+        "cambiar pedido",
+        "cancelar pedido"
+    }
+
+    return texto in cancelaciones
+
+def audio_part_key(session, index):
+    return f"AUDIO#{session}#{index:03d}"
+
+
+def guardar_parte_audio(pk, body):
+    session = body.get("audio_id")
+    index = body.get("indice")
+    total = body.get("total")
+    contenido = body.get("datos")
+    if not isinstance(session, str) or not re.fullmatch(r"[a-f0-9]{32}", session):
+        raise ValueError("Identificador de audio invalido")
+    if not isinstance(index, int) or not isinstance(total, int) or not 1 <= total <= MAX_AUDIO_PARTS or not 0 <= index < total:
+        raise ValueError("Fragmento de audio invalido")
+    if not isinstance(contenido, str) or len(contenido) > 17000:
+        raise ValueError("Fragmento demasiado grande")
+    datos = base64.b64decode(contenido, validate=True)
+    if not datos or len(datos) > 12000:
+        raise ValueError("Fragmento invalido")
+    TABLA.put_item(Item={
+        "PK": pk, "SK": audio_part_key(session, index),
+        "datos": datos, "total": total,
+        "creado": int(time.time())
+    })
+    return session, index
+
+
+def transcribir_audio(pk, body):
+    session = body.get("audio_id")
+    total = body.get("total")
+    if not isinstance(session, str) or not re.fullmatch(r"[a-f0-9]{32}", session):
+        raise ValueError("Identificador invalido")
+    if not isinstance(total, int) or not 1 <= total <= MAX_AUDIO_PARTS:
+        raise ValueError("Numero de fragmentos invalido")
+    partes = []
+    try:
+        for i in range(total):
+            result = TABLA.get_item(Key={"PK": pk, "SK": audio_part_key(session, i)}, ConsistentRead=True)
+            obj = result.get("Item")
+            if not obj or obj.get("total") != total or int(time.time()) - int(obj.get("creado", 0)) > 300:
+                raise ValueError("Faltan fragmentos de audio o han caducado")
+            partes.append(bytes(obj["datos"]))
+        audio = b"".join(partes)
+        if len(audio) > MAX_AUDIO_BYTES:
+            raise ValueError("Audio demasiado grande")
+        archivo = io.BytesIO(audio)
+        archivo.name = "grabacion.webm"
+        texto = IA.audio.transcriptions.create(model="gpt-4o-mini-transcribe", file=archivo).text
+        if not texto or not texto.strip():
+            raise ValueError("No se pudo reconocer la voz")
+        return texto.strip()[:2000]
+    finally:
+        with TABLA.batch_writer() as batch:
+            for i in range(total):
+                batch.delete_item(Key={"PK": pk, "SK": audio_part_key(session, i)})
+
+
+def numero_en_palabras(n):
+    """Convierte importes enteros a palabras para la voz (0 a 999999)."""
+    unidades = ["cero", "uno", "dos", "tres", "cuatro", "cinco", "seis", "siete", "ocho", "nueve", "diez", "once", "doce", "trece", "catorce", "quince", "dieciséis", "diecisiete", "dieciocho", "diecinueve", "veinte", "veintiuno", "veintidós", "veintitrés", "veinticuatro", "veinticinco", "veintiséis", "veintisiete", "veintiocho", "veintinueve"]
+    decenas = ["", "", "", "treinta", "cuarenta", "cincuenta", "sesenta", "setenta", "ochenta", "noventa"]
+    centenas = ["", "ciento", "doscientos", "trescientos", "cuatrocientos", "quinientos", "seiscientos", "setecientos", "ochocientos", "novecientos"]
+    if n < 30:
+        return unidades[n]
+    if n < 100:
+        return decenas[n // 10] + (" y " + unidades[n % 10] if n % 10 else "")
+    if n == 100:
+        return "cien"
+    if n < 1000:
+        return centenas[n // 100] + (" " + numero_en_palabras(n % 100) if n % 100 else "")
+    if n < 1000000:
+        miles, resto = divmod(n, 1000)
+        prefijo = "mil" if miles == 1 else numero_en_palabras(miles) + " mil"
+        return prefijo + (" " + numero_en_palabras(resto) if resto else "")
+    return str(n)
+
+
+def precio_para_voz(texto):
+    """Solo modifica el texto de TTS; no cambia mensajes ni importes Stripe."""
+    patron = r"(?i)(?:S/\s*|\bPEN\s+)(\d{1,6})(?:[.,](\d{2}))?"
+
+    def convertir(match):
+        soles = int(match.group(1))
+        centimos = int(match.group(2) or 0)
+        palabras = numero_en_palabras(soles)
+        if soles > 1 and palabras.endswith("uno"):
+            palabras = palabras[:-3] + "un"
+        resultado = palabras + (" sol" if soles == 1 else " soles")
+        if centimos:
+            resultado += " con " + numero_en_palabras(centimos) + (" céntimo" if centimos == 1 else " céntimos")
+        return resultado
+
+    return re.sub(patron, convertir, texto)
+
+
+def enviar_voz(api, conexion, respuesta):
+    texto = precio_para_voz(respuesta[:1800])
+    voz = IA.audio.speech.create(model="gpt-4o-mini-tts", voice="coral", input=texto)
+    audio = voz.content
+    if len(audio) > 1200000:
+        raise ValueError("Respuesta de voz demasiado grande")
+    partes = [audio[i:i + 12000] for i in range(0, len(audio), 12000)]
+    audio_id = uuid.uuid4().hex
+    enviar(api, conexion, {"tipo": "voz_inicio", "audio_id": audio_id, "total": len(partes)})
+    for i, parte in enumerate(partes):
+        enviar(api, conexion, {"tipo": "voz_parte", "audio_id": audio_id, "indice": i,
+                              "datos": base64.b64encode(parte).decode("ascii")})
+    enviar(api, conexion, {"tipo": "voz_fin", "audio_id": audio_id})
+
+
+def lambda_handler(event, context):
+
+    ctx = event.get("requestContext", {})
+
+    ruta = ctx.get("routeKey")
+
+    if ruta in ("$connect", "$disconnect"):
+        return {"statusCode": 200}
+
+    if ruta not in ("enviarmensaje", "$default"):
+        return {"statusCode": 200}
+
+    conexion = ctx["connectionId"]
+
+    api = boto3.client(
+        "apigatewaymanagementapi",
+        endpoint_url=(
+            f"https://{ctx['domainName']}/"
+            f"{ctx['stage']}"
+        )
+    )
+
+    try:
+
+        body = json.loads(
+            event.get("body") or "{}"
+        )
+
+        pk, sk = claves(
+            body.get("chat_token")
+        )
+
+        item = leer(pk, sk)
+
+        historial = item.get(
+            "historial", []
+        )
+
+        operacion = body.get(
+            "operacion",
+            "mensaje"
+        )
+
+
+        if operacion == "audio_parte":
+            session, index = guardar_parte_audio(pk, body)
+            enviar(api, conexion, {"tipo": "audio_ack", "audio_id": session, "indice": index})
+            return {"statusCode": 200}
+
+        if operacion == "recuperar":
+
+            enviar(api, conexion, {
+                "tipo": "historial",
+                "historial": historial[-150:]
+            })
+
+            return {"statusCode": 200}
+
+
+
+        if operacion == "verificar_pago":
+
+            verificar_pago(
+                api=api,
+                conexion=conexion,
+                session_id=body.get(
+                    "session_id", ""
+                ),
+                pk=pk,
+                sk=sk,
+                item=item,
+                historial=historial
+            )
+
+            return {"statusCode": 200}
+
+
+        es_audio = operacion == "audio"
+        if es_audio:
+            mensaje = transcribir_audio(pk, body)
+            enviar(api, conexion, {"tipo": "transcripcion", "mensaje": mensaje})
+        else:
+            mensaje = body.get("mensaje", "")
+
+        if (
+            not isinstance(mensaje, str)
+            or not mensaje.strip()
+        ):
+
+            enviar(api, conexion, {
+                "tipo": "error",
+                "mensaje": (
+                    "Escribe un mensaje valido."
+                )
+            })
+
+            return {"statusCode": 200}
+
+        mensaje = mensaje.strip()[:2000]
+
+        pedido = item.get(
+            "pedido_pendiente", []
+        )
+
+        estado = item.get(
+            "estado_pedido", ""
+        )
+
+        url_pago = None
+
+        if (
+            estado == "esperando_confirmacion"
+            and pedido
+            and es_confirmacion(mensaje)
+        ):
+
+            sesion = crear_checkout(
+                pedido,
+                pk,
+                sk
+            )
+
+            item["stripe_session_id"] = (
+                sesion.id
+            )
+
+            url_pago = sesion.url
+
+            detalle, _ = resumen(pedido)
+
+            respuesta = (
+                "¡Listo! ☕ Tu enlace seguro "
+                "de Stripe está preparado.\n"
+                + detalle
+            )
+
+            estado = "checkout_creado"
+
+        elif (
+            estado == "esperando_confirmacion"
+            and es_cancelacion(mensaje)
+        ):
+
+            pedido = []
+            estado = ""
+
+            respuesta = (
+                "¡Entendido! Cancelé el pedido. "
+                "¿Qué te gustaría pedir?"
+            )
+
+        elif (
+            estado == "checkout_creado"
+            and pedido
+            and es_confirmacion(mensaje)
+        ):
+
+            respuesta = (
+                "Tu enlace de pago ya fue "
+                "generado. Usa el botón "
+                "Pagar con Stripe del "
+                "mensaje anterior."
+            )
+
+
+        else:
+
+            nuevos = interpretar(mensaje)
+
+            if nuevos:
+
+                pedido = nuevos
+
+                estado = (
+                    "esperando_confirmacion"
+                )
+
+                item.pop(
+                    "stripe_session_id",
+                    None
+                )
+
+                detalle, _ = resumen(pedido)
+
+                respuesta = (
+                    "Este es tu pedido:\n"
+                    + detalle
+                    + "\n¿Confirmas que deseas "
+                    "pagar? Responde "
+                    '"sí" o "cancelar".'
+                )
+
+            elif (
+                estado
+                == "esperando_confirmacion"
+            ):
+
+                detalle, _ = resumen(pedido)
+
+                respuesta = (
+                    "Tu pedido pendiente es:\n"
+                    + detalle
+                    + "\nResponde "
+                    '"sí" para pagar '
+                    'o "cancelar".'
+                )
+
+            else:
+
+                resultado = IA.responses.create(
+                    model="gpt-4.1-mini",
+                    instructions=(
+                        "Eres CafeBot IA, "
+                        "asistente amable de "
+                        "una cafeteria. "
+                        "Responde breve en español. "
+                        "Menu: "
+                        + "; ".join(
+                            f"{p['nombre']} "
+                            f"S/ {p['precio']/100:.2f}"
+                            for p in CATALOGO.values()
+                        )
+                        + ". No inventes precios "
+                        "ni disponibilidad."
+                    ),
+                    input=(
+                        historial
+                        + [{
+                            "role": "user",
+                            "content": mensaje
+                        }]
+                    )[-20:],
+                    max_output_tokens=300
+                )
+
+                respuesta = (
+                    resultado.output_text
+                )
+
+
+
+        historial.extend([
+            {
+                "role": "user",
+                "content": mensaje
+            },
+            {
+                "role": "assistant",
+                "content": respuesta
+            }
+        ])
+
+        item["historial"] = historial
+
+        item["pedido_pendiente"] = pedido
+
+        item["estado_pedido"] = estado
+
+        guardar(pk, sk, item)
+
+
+
+        salida = {
+            "tipo": (
+                "pago"
+                if url_pago
+                else "respuesta"
+            ),
+            "mensaje": respuesta
+        }
+
+        if url_pago:
+            salida["url_pago"] = url_pago
+
+        enviar(
+            api,
+            conexion,
+            salida
+        )
+
+        if es_audio:
+            try:
+                enviar_voz(api, conexion, respuesta)
+            except Exception as voz_error:
+                print("Error generando voz:", type(voz_error).__name__, str(voz_error))
+                enviar(api, conexion, {"tipo": "voz_error", "mensaje": "No se pudo reproducir la voz, pero la respuesta escrita está disponible."})
+
+        return {"statusCode": 200}
+
+    except Exception as e:
+
+        print(
+            "Error CafeBot:",
+            type(e).__name__,
+            str(e)
+        )
+
+        try:
+
+            enviar(api, conexion, {
+                "tipo": "error",
+                "mensaje": (
+                    "Ocurrió un error. "
+                    "Revisa los logs de Lambda."
+                )
+            })
+
+        except Exception:
+            pass
+
+        return {"statusCode": 500}
